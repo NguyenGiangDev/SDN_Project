@@ -1,4 +1,4 @@
-# SND PROJECTPROJECT
+# SND PROJECT
  ### QUY TẮC LÀM VIỆC TRÊN GITHUB
  - Trước khi bắt đầu làm, kiểm tra nhánh master nếu có thay đổi thì pull về local
  - Chỉ commit khi hoàn thành 1 chức năng / sửa xong 1 bug nào đó, không commit khi đang làm dở, không commit dồn

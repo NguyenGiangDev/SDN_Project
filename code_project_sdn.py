@@ -56,7 +56,7 @@ class AdaptiveMonitor13(simple_switch_13.SimpleSwitch13):
       
         self.last_poll_time = {}
         
-       
+        self.qos_applied = {}
         self.DEFAULT_INTERVAL = 10  # thời gian lặp mặc định
         self.MIN_INTERVAL = 1       # thời gian lặp khi phát hiện high traffic
         self.THRESHOLD_BYTES_PER_SEC = 1000000  # 1 Mbps threshold
@@ -114,29 +114,11 @@ class AdaptiveMonitor13(simple_switch_13.SimpleSwitch13):
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
 
-    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-    def _flow_stats_reply_handler(self, ev):
-        body = ev.msg.body
-
-        self.logger.info('datapath         '
-                         'in-port  eth-dst           '
-                         'out-port packets  bytes')
-        self.logger.info('---------------- '
-                         '-------- ----------------- '
-                         '-------- -------- --------')
-        for stat in sorted([flow for flow in body if flow.priority == 1],
-                           key=lambda flow: (flow.match['in_port'],
-                                             flow.match['eth_dst'])):
-            self.logger.info('%016x %8x %17s %8x %8d %8d',
-                             ev.msg.datapath.id,
-                             stat.match['in_port'], stat.match['eth_dst'],
-                             stat.instructions[0].actions[0].port,
-                             stat.packet_count, stat.byte_count)
-
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
         body = ev.msg.body
-        datapath_id = ev.msg.datapath.id
+        datapath = ev.msg.datapath
+        datapath_id = datapath.id
         current_time = time.time()
         max_bytes_per_sec = 0
 
@@ -166,10 +148,10 @@ class AdaptiveMonitor13(simple_switch_13.SimpleSwitch13):
 
                 max_bytes_per_sec = max(max_bytes_per_sec, bytes_per_sec)
 
-            # Cập nhật dữ liệu cho Prometheus
+            # Prometheus gauge update
             self.port_traffic_gauge.labels(dpid=str(datapath_id), port=str(port_no)).set(bytes_per_sec)
 
-            # Cập nhật dữ liệu theo dõi
+            # Cập nhật thông tin hiện tại
             if datapath_id not in self.port_stats:
                 self.port_stats[datapath_id] = {}
             self.port_stats[datapath_id][port_no] = {
@@ -184,61 +166,25 @@ class AdaptiveMonitor13(simple_switch_13.SimpleSwitch13):
                             stat.tx_packets, stat.tx_bytes, stat.tx_errors,
                             int(bytes_per_sec))
 
-            # Giám sát và gửi email nếu vượt ngưỡng NGAY LẬP TỨC
+            # Gửi cảnh báo email nếu quá tải
             if bytes_per_sec > self.THRESHOLD_BYTES_PER_SEC:
                 if key not in self.alert_status or current_time - self.alert_status[key] > 60:
                     send_alert_email(datapath_id, port_no, bytes_per_sec)
                     self.logger.info('[EMAIL ALERT] HIGH TRAFFIC DETECTED IMMEDIATELY!')
-                    self.alert_status[key] = current_time  # Cập nhật thời gian gửi cảnh báo
+                    self.alert_status[key] = current_time
             else:
                 if key in self.alert_status:
                     del self.alert_status[key]
 
-        # QoS dynamic logic
-        if max_bytes_per_sec > self.THRESHOLD_BYTES_PER_SEC:
-            if self.poll_interval > self.MIN_INTERVAL:
-                self.poll_interval = self.MIN_INTERVAL
-                self.logger.info('❌ High traffic detected (%d bytes/sec)! Decreasing polling interval to %d seconds',
-                                int(max_bytes_per_sec), self.poll_interval)
-                self._apply_qos_policy(datapath_id)
-                self.qos_removed = False
-        else:
-            if self.poll_interval < self.DEFAULT_INTERVAL and not self.qos_removed:
-                self.poll_interval = self.DEFAULT_INTERVAL
-                self.logger.info('✅ Traffic back to normal (%d bytes/sec). Resetting polling interval to %d seconds in 15s...',
-                                int(max_bytes_per_sec), self.poll_interval)
-                hub.spawn(self._delayed_qos_removal, datapath_id)
+            # ✅ Áp dụng QoS cho cổng này nếu cần
+            if max_bytes_per_sec > self.THRESHOLD_BYTES_PER_SEC and not self.qos_applied.get((datapath_id, port_no), False):
+                parser = datapath.ofproto_parser
+                ofproto = datapath.ofproto
 
-
-    # Hàm phụ trợ
-    def _delayed_qos_removal(self, datapath_id):
-        hub.sleep(15)  # Đợi 15 giây
-        self.logger.info('🔁 Removing QoS policy for datapath %016x after delay', datapath_id)
-        self._remove_qos_policy(datapath_id)
-        self.qos_removed = True  # Đánh dấu đã gỡ
-
-    def _apply_qos_policy(self, datapath_id):
-        datapath = self.datapaths.get(datapath_id)
-        if not datapath:
-            return
-
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-     
-        port_map = {
-            's1': {1: 2, 2: 1},  # switch s1
-            's2': {1: 3, 3: 2},  # switch s2
-            's3': {1: 4, 4: 3},  # switch s3
-            's4': {2: 1},        # switch s4 (có 1 kết nối với s3)
-        }
-
-        for switch, ports in port_map.items():
-            for in_port, out_port in ports.items():
-                match = parser.OFPMatch(in_port=in_port)
+                match = parser.OFPMatch(in_port=port_no)
                 actions = [
                     parser.OFPActionSetQueue(1),
-                    parser.OFPActionOutput(out_port)
+                    parser.OFPActionOutput(port_no)
                 ]
                 instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
                 mod = parser.OFPFlowMod(
@@ -250,7 +196,41 @@ class AdaptiveMonitor13(simple_switch_13.SimpleSwitch13):
                     hard_timeout=30
                 )
                 datapath.send_msg(mod)
-                self.logger.info("📊 QoS applied: switch %s, in_port %d → out_port %d", switch, in_port, out_port)
+                self.logger.info("📊 QoS applied: switch %s, port %d", datapath_id, port_no)
+                self.qos_applied[(datapath_id, port_no)] = True
+            else:
+                if max_bytes_per_sec <= self.THRESHOLD_BYTES_PER_SEC:
+                    # Kiểm tra xem QoS có được áp dụng cho datapath này không
+                    if self.qos_applied.get((datapath_id, port_no), False):
+                        hub.spawn(self._delayed_qos_removal, datapath_id)
+                    else:
+                        self.logger.debug("No QoS applied for switch %s, port %d. Skipping QoS removal.", datapath_id, port_no)
+
+        # Quản lý polling interval
+        if max_bytes_per_sec > self.THRESHOLD_BYTES_PER_SEC:
+            if self.poll_interval > self.MIN_INTERVAL:
+                self.poll_interval = self.MIN_INTERVAL
+                self.logger.info('❌ High traffic detected (%d bytes/sec)! Decreasing polling interval to %d seconds',
+                                int(max_bytes_per_sec), self.poll_interval)
+                self.qos_removed = False
+        else:
+            if self.poll_interval < self.DEFAULT_INTERVAL and not self.qos_removed:
+                self.poll_interval = self.DEFAULT_INTERVAL
+                self.logger.info('✅ Traffic back to normal (%d bytes/sec). Resetting polling interval to %d seconds in 15s...',
+                                int(max_bytes_per_sec), self.poll_interval)
+
+
+
+    def _delayed_qos_removal(self, datapath_id):
+        hub.sleep(15)
+        self.logger.info('🔁 Removing QoS policy for datapath %016x after delay', datapath_id)
+        self._remove_qos_policy(datapath_id)
+        self.qos_removed = True
+        # Xoá trạng thái áp dụng
+        for key in list(self.qos_applied.keys()):
+            if key[0] == datapath_id:
+                del self.qos_applied[key]
+
 
 
 
